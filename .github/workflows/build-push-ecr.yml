@@ -1,0 +1,187 @@
+name: Build & Push to ECR (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: true
+        type: string
+      aws_account_id:
+        required: true
+        type: string
+      aws_role_arn:
+        required: true
+        type: string
+      ecr_repository:
+        required: true
+        type: string
+      dockerfile:
+        required: false
+        type: string
+        default: ./Dockerfile
+      build_context:
+        required: false
+        type: string
+        default: .
+      targets:
+        required: false
+        type: string
+        default: >-
+          [{"arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+           {"arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"}]
+      build_timeout_minutes:
+        required: false
+        type: number
+        default: 90
+    outputs:
+      image:
+        value: ${{ jobs.prepare.outputs.image }}
+      tag:
+        value: ${{ jobs.prepare.outputs.tag }}
+      registry:
+        value: ${{ jobs.prepare.outputs.registry }}
+
+jobs:
+  prepare:
+    name: Resolve image tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.meta.outputs.image }}
+      registry: ${{ steps.meta.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve tag
+        id: meta
+        env:
+          AWS_ACCOUNT_ID: ${{ inputs.aws_account_id }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          ECR_REPO_NAME: ${{ inputs.ecr_repository }}
+        run: |
+          set -euo pipefail
+          BRANCH="$(printf '%s' "${GITHUB_REF_NAME}" | tr '/' '-' | tr -cd '[:alnum:]._-')"
+          SHORT_SHA="$(git rev-parse --short=6 HEAD)"
+          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          TAG="${BRANCH}-${SHORT_SHA}"
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${ECR_REPO_NAME}:${TAG}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: gha-prepare-${{ github.run_id }}
+
+      - name: Ensure tag is unused
+        env:
+          ECR_REPO_NAME: ${{ inputs.ecr_repository }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if aws ecr describe-images \
+              --repository-name "${ECR_REPO_NAME}" \
+              --image-ids imageTag="${TAG}" \
+              --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists in ECR (IMMUTABLE). Push a new commit."
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(inputs.targets) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ inputs.build_timeout_minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: gha-${{ matrix.arch }}-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=${{ needs.prepare.outputs.registry }}/${{ inputs.ecr_repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ inputs.ecr_repository }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.ecr_repository }}-${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create manifest list
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: gha-merge-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE_BASE: ${{ needs.prepare.outputs.registry }}/${{ inputs.ecr_repository }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMAGE}" \
+            $(printf "${IMAGE_BASE}@sha256:%s " *)
+
+      - name: Inspect
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+        run: docker buildx imagetools inspect "${IMAGE}"
+
+      - name: Summary
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+        run: |
+          {
+            echo "### Image pushed"
+            echo ""
+            echo '```'
+            echo "${IMAGE}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
