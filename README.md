@@ -20,6 +20,10 @@ Tag convention: `<branch>-<6-char-commit>`, with `/` sanitized to `-`.
 | `ecr_repository` | yes | | ECR repository name |
 | `dockerfile` | no | `./Dockerfile` | Dockerfile path |
 | `build_context` | no | `.` | Build context |
+| `build_args` | no | | Newline-separated `KEY=value` build args |
+| `build_target` | no | | Multi-stage target stage |
+| `cache_scope` | no | `ecr_repository` | GHA cache scope override for monorepos |
+| `tag_prefix` | no | | Prefix added before `<branch>-<sha>` |
 | `targets` | no | amd64 + arm64 | JSON array of `{arch, platform, runner}` |
 | `build_timeout_minutes` | no | `90` | Per-arch build timeout |
 
@@ -58,9 +62,35 @@ jobs:
 `permissions` must be declared by the caller. A reusable workflow cannot widen the token
 it receives, so omitting `id-token: write` fails the OIDC assume-role step.
 
+## lint-test.yml
+
+One entry point for every service regardless of language. `language` selects which job
+runs (`python`, `node`, `go`, `java`); the others are skipped. `pre-commit` runs alongside
+unless disabled.
+
+| Input | Required | Default | Purpose |
+|---|---|---|---|
+| `language` | yes | | `python` \| `node` \| `go` \| `java` |
+| `version` | no | per-language | Toolchain version |
+| `package_manager` | no | per-language | `uv`, `npm`, `pnpm`, `yarn`, `maven`, `gradle` |
+| `working_directory` | no | `.` | Subdirectory for monorepos |
+| `runner` | no | `ubuntu-latest` | Runner label |
+| `run_pre_commit` | no | `true` | Also run the pre-commit gate |
+| `lint_command` | no | per-language | Override lint step |
+| `test_command` | no | per-language | Override test step |
+
+```yaml
+jobs:
+  ci:
+    uses: hungpham-finx/workflows/.github/workflows/lint-test.yml@poc
+    with:
+      language: python
+      package_manager: uv
+```
+
 ## pre-commit.yml
 
-Runs `pre-commit` over the calling repository. Inputs: `python_version` (default `3.12`),
+Standalone pre-commit gate. Inputs: `python_version` (default `3.12`),
 `extra_args` (default `--all-files`).
 
 ```yaml

@@ -23,6 +23,22 @@ on:
         required: false
         type: string
         default: .
+      build_args:
+        required: false
+        type: string
+        default: ""
+      build_target:
+        required: false
+        type: string
+        default: ""
+      cache_scope:
+        required: false
+        type: string
+        default: ""
+      tag_prefix:
+        required: false
+        type: string
+        default: ""
       targets:
         required: false
         type: string
@@ -58,12 +74,13 @@ jobs:
           AWS_ACCOUNT_ID: ${{ inputs.aws_account_id }}
           AWS_REGION: ${{ inputs.aws_region }}
           ECR_REPO_NAME: ${{ inputs.ecr_repository }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
         run: |
           set -euo pipefail
           BRANCH="$(printf '%s' "${GITHUB_REF_NAME}" | tr '/' '-' | tr -cd '[:alnum:]._-')"
           SHORT_SHA="$(git rev-parse --short=6 HEAD)"
           REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-          TAG="${BRANCH}-${SHORT_SHA}"
+          TAG="${TAG_PREFIX}${BRANCH}-${SHORT_SHA}"
           echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "image=${REGISTRY}/${ECR_REPO_NAME}:${TAG}" >> "$GITHUB_OUTPUT"
@@ -117,10 +134,12 @@ jobs:
           context: ${{ inputs.build_context }}
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
+          target: ${{ inputs.build_target }}
+          build-args: ${{ inputs.build_args }}
           provenance: false
           outputs: type=image,name=${{ needs.prepare.outputs.registry }}/${{ inputs.ecr_repository }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ inputs.ecr_repository }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ inputs.ecr_repository }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ inputs.cache_scope || inputs.ecr_repository }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.cache_scope || inputs.ecr_repository }}-${{ matrix.arch }}
 
       - name: Export digest
         env:
